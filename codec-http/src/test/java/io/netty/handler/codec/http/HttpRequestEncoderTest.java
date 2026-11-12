@@ -21,6 +21,7 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.util.CharsetUtil;
 import io.netty.util.IllegalReferenceCountException;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 
@@ -354,6 +355,58 @@ public class HttpRequestEncoderTest {
         assertTrue(channel.writeOutbound(new DefaultHttpContent(Unpooled.copiedBuffer("test", CharsetUtil.US_ASCII))));
         assertTrue(channel.writeOutbound(LastHttpContent.EMPTY_LAST_CONTENT));
         assertTrue(channel.finishAndReleaseAll());
+    }
+
+    /**
+     * A request URI changed via {@link HttpRequest#setUri(String)} must not be able to smuggle additional
+     * requests into the encoded output.
+     */
+    @Test
+    public void testSetUriMustNotSmuggleRequests() {
+        final FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/safe");
+        final String smuggled = "/safe HTTP/1.1\r\n"
+                + "Host: localhost\r\n"
+                + "\r\n"
+                + "POST /internal HTTP/1.1\r\n"
+                + "Host: localhost\r\n"
+                + "Content-Length: 4\r\n"
+                + "\r\n"
+                + "data"
+                + "GET /tail";
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                request.setUri(smuggled);
+            }
+        });
+        assertEquals("/safe", request.uri());
+
+        EmbeddedChannel encoder = new EmbeddedChannel(new HttpRequestEncoder());
+        assertTrue(encoder.writeOutbound(request));
+        EmbeddedChannel decoder = new EmbeddedChannel(new HttpRequestDecoder());
+        for (;;) {
+            ByteBuf buf = encoder.readOutbound();
+            if (buf == null) {
+                break;
+            }
+            decoder.writeInbound(buf);
+        }
+
+        int requests = 0;
+        for (;;) {
+            Object msg = decoder.readInbound();
+            if (msg == null) {
+                break;
+            }
+            if (msg instanceof HttpRequest) {
+                requests++;
+                assertEquals("/safe", ((HttpRequest) msg).uri());
+            }
+            ReferenceCountUtil.release(msg);
+        }
+        assertEquals(1, requests);
+        encoder.finishAndReleaseAll();
+        decoder.finishAndReleaseAll();
     }
 
     /**

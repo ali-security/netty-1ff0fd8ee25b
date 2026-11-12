@@ -26,9 +26,13 @@ import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.util.CharsetUtil;
+import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Test cases for RTSP encoder.
@@ -169,5 +173,58 @@ public class RtspEncoderTest {
         String actual = buf.toString(CharsetUtil.UTF_8);
         buf.release();
         assertEquals(expected, actual);
+    }
+
+    /**
+     * A request URI changed via {@link HttpRequest#setUri(String)} must not be able to smuggle additional
+     * RTSP requests into the encoded output.
+     */
+    @Test
+    public void testSetUriMustNotInjectAdditionalRequests() {
+        final HttpRequest request = new DefaultHttpRequest(RtspVersions.RTSP_1_0, RtspMethods.OPTIONS,
+                "rtsp://172.10.20.30:554/safe");
+        request.headers().add(RtspHeaderNames.CSEQ, "1");
+
+        final String injected = "rtsp://172.10.20.30:554/safe RTSP/1.0\r\n"
+                + "cseq: 1\r\n"
+                + "\r\n"
+                + "DESCRIBE rtsp://172.10.20.30:554/internal RTSP/1.0\r\n"
+                + "cseq: 2\r\n"
+                + "\r\n"
+                + "OPTIONS rtsp://172.10.20.30:554/tail";
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() throws Throwable {
+                request.setUri(injected);
+            }
+        });
+        assertEquals("rtsp://172.10.20.30:554/safe", request.uri());
+
+        EmbeddedChannel encoder = new EmbeddedChannel(new RtspEncoder());
+        assertTrue(encoder.writeOutbound(request));
+        EmbeddedChannel decoder = new EmbeddedChannel(new RtspDecoder());
+        for (;;) {
+            ByteBuf buf = encoder.readOutbound();
+            if (buf == null) {
+                break;
+            }
+            decoder.writeInbound(buf);
+        }
+
+        int requests = 0;
+        for (;;) {
+            Object msg = decoder.readInbound();
+            if (msg == null) {
+                break;
+            }
+            if (msg instanceof HttpRequest) {
+                requests++;
+                assertEquals("rtsp://172.10.20.30:554/safe", ((HttpRequest) msg).uri());
+            }
+            ReferenceCountUtil.release(msg);
+        }
+        assertEquals(1, requests);
+        encoder.finishAndReleaseAll();
+        decoder.finishAndReleaseAll();
     }
 }

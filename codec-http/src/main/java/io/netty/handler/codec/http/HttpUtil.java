@@ -76,6 +76,50 @@ public final class HttpUtil {
         return "*".equals(uri);
     }
 
+    static void validateRequestLineTokens(HttpVersion httpVersion, HttpMethod method, String uri) {
+        // The HttpVersion class does its own validation, and it's not possible for subclasses to circumvent it.
+        // The HttpMethod class does its own validation, but subclasses might circumvent it.
+        if (method.getClass() != HttpMethod.class) {
+            if (!isEncodingSafeStartLineToken(method.asciiName())) {
+                throw new IllegalArgumentException(
+                        "The HTTP method name contain illegal characters: " + method.asciiName());
+            }
+        }
+
+        if (!isEncodingSafeStartLineToken(uri)) {
+            throw new IllegalArgumentException("The URI contain illegal characters: " + uri);
+        }
+    }
+
+    /**
+     * Validate that the given request line token is safe for verbatim encoding to the network.
+     * This does not fully check that the token – HTTP method, version, or URI – is valid and formatted correctly.
+     * Only that the token does not contain characters that would break or
+     * desynchronize HTTP message parsing of the start line wherein the token would be included.
+     * <p>
+     * See <a href="https://datatracker.ietf.org/doc/html/rfc9112#name-request-line">RFC 9112, 3.</a>
+     *
+     * @param token The token to check.
+     * @return {@code true} if the token is safe to encode verbatim into the HTTP message output stream,
+     * otherwise {@code false}.
+     */
+    public static boolean isEncodingSafeStartLineToken(CharSequence token) {
+        int lenBytes = token.length();
+        for (int i = 0; i < lenBytes; i++) {
+            char ch = token.charAt(i);
+            // this is to help AOT compiled code which cannot profile the switch
+            if (ch <= ' ') {
+                switch (ch) {
+                    case '\n':
+                    case '\r':
+                    case ' ':
+                        return false;
+                }
+            }
+        }
+        return true;
+    }
+
     /**
      * Returns {@code true} if and only if the connection can remain open and
      * thus 'kept alive'.  This methods respects the value of the.
