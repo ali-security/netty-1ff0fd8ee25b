@@ -18,6 +18,7 @@ package io.netty.handler.codec.http;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.DecoderException;
 import io.netty.util.CharsetUtil;
 import io.netty.util.ReferenceCountUtil;
 import org.junit.jupiter.api.Test;
@@ -29,6 +30,8 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class HttpServerCodecTest {
@@ -613,6 +616,126 @@ public class HttpServerCodecTest {
         buf.release();
 
         assertFalse(ch.finishAndReleaseAll());
+    }
+
+    @Test
+    public void testMaxPipelineDepthLimited() {
+        HttpServerCodec codec = new HttpServerCodec(new HttpDecoderConfig(), 2);
+        final EmbeddedChannel ch = new EmbeddedChannel(codec);
+
+        final ByteBuf request = Unpooled.copiedBuffer(
+                "GET / HTTP/1.1\r\nHost: netty.io\r\nContent-Length: 0\r\n\r\n", CharsetUtil.US_ASCII);
+        try {
+            assertTrue(ch.writeInbound(request.retainedDuplicate()));
+            HttpRequest req = ch.readInbound();
+            LastHttpContent content = ch.readInbound();
+            content.release();
+            assertTrue(ch.writeInbound(request.retainedDuplicate()));
+            req = ch.readInbound();
+            content = ch.readInbound();
+            content.release();
+
+            assertThrows(DecoderException.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    ch.writeInbound(request.retainedDuplicate());
+                }
+            });
+
+            // This one will be just discarded
+            assertFalse(ch.writeInbound(
+                request.retainedDuplicate()));
+
+            // Writing the response will close the channel.
+            assertTrue(ch.writeOutbound(new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)));
+            ReferenceCountUtil.release(ch.readOutbound());
+
+            assertFalse(ch.isActive());
+        } finally {
+            request.release();
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    public void testMaxPipelineDepthLimitedByDefault() {
+        // A peer that pipelines a burst of requests without ever reading the responses must not be able to
+        // grow the per-connection method queue without bound when the codec is created with the default options.
+        final EmbeddedChannel ch = new EmbeddedChannel(new HttpServerCodec());
+
+        final ByteBuf request = Unpooled.copiedBuffer(
+                "GET / HTTP/1.1\r\nHost: netty.io\r\nContent-Length: 0\r\n\r\n", CharsetUtil.US_ASCII);
+        final ByteBuf pipelined = Unpooled.buffer();
+        for (int i = 0; i <= HttpServerCodec.DEFAULT_MAX_PIPELINE_DEPTH; i++) {
+            pipelined.writeBytes(request, request.readerIndex(), request.readableBytes());
+        }
+        try {
+            assertThrows(DecoderException.class, new Executable() {
+                @Override
+                public void execute() throws Throwable {
+                    ch.writeInbound(pipelined);
+                }
+            });
+
+            // Only the requests up to the limit were decoded.
+            for (int i = 0; i < HttpServerCodec.DEFAULT_MAX_PIPELINE_DEPTH; i++) {
+                HttpRequest req = ch.readInbound();
+                assertNotNull(req);
+                LastHttpContent content = ch.readInbound();
+                content.release();
+            }
+            assertNull(ch.readInbound());
+
+            // Everything that follows is discarded.
+            assertFalse(ch.writeInbound(request.retainedDuplicate()));
+            assertNull(ch.readInbound());
+
+            // Writing the response will close the channel.
+            assertTrue(ch.writeOutbound(new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK)));
+            ch.releaseOutbound();
+
+            assertFalse(ch.isActive());
+        } finally {
+            request.release();
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    public void testMaxPipelineDepthAllowsRequestsOnceResponsesAreWritten() {
+        EmbeddedChannel ch = new EmbeddedChannel(new HttpServerCodec(new HttpDecoderConfig(), 1));
+
+        ByteBuf request = Unpooled.copiedBuffer(
+                "GET / HTTP/1.1\r\nHost: netty.io\r\nContent-Length: 0\r\n\r\n", CharsetUtil.US_ASCII);
+        try {
+            for (int i = 0; i < 4; i++) {
+                assertTrue(ch.writeInbound(request.retainedDuplicate()));
+                HttpRequest req = ch.readInbound();
+                assertNotNull(req);
+                LastHttpContent content = ch.readInbound();
+                content.release();
+
+                FullHttpResponse response = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, HttpResponseStatus.OK);
+                response.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, 0);
+                assertTrue(ch.writeOutbound(response));
+                assertTrue(ch.releaseOutbound());
+
+                assertTrue(ch.isActive());
+            }
+        } finally {
+            request.release();
+            ch.finishAndReleaseAll();
+        }
+    }
+
+    @Test
+    public void testMaxPipelineDepthMustBePositive() {
+        assertThrows(IllegalArgumentException.class, new Executable() {
+            @Override
+            public void execute() {
+                new HttpServerCodec(new HttpDecoderConfig(), 0);
+            }
+        });
     }
 
     private static ByteBuf prepareDataChunk(int size) {
